@@ -454,7 +454,7 @@ const DashboardController = {
         text: statusObj.text
       });
 
-      if (this._ppmData.length > 50) this._ppmData.shift();
+      if (this._ppmData.length > 100) this._ppmData.shift();
 
       const sum = this._ppmData.reduce((acc, cur) => acc + cur.bac, 0);
       const avg = sum / this._ppmData.length;
