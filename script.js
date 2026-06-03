@@ -57,10 +57,10 @@ function escapeHTML(str) {
 const StorageService = {
   PROFILE_KEY: 'iot_monitor_profile',
 
-  /** Simpan objek profil ke localStorage */
+  /** Simpan objek profil ke sessionStorage (lebih kompatibel di domain publik/Cloudflare) */
   saveProfile(profile) {
     try {
-      localStorage.setItem(this.PROFILE_KEY, JSON.stringify(profile));
+      sessionStorage.setItem(this.PROFILE_KEY, JSON.stringify(profile));
       return true;
     } catch (err) {
       console.error('[StorageService] Gagal menyimpan profil:', err);
@@ -68,10 +68,10 @@ const StorageService = {
     }
   },
 
-  /** Ambil profil dari localStorage; null jika belum ada */
+  /** Ambil profil dari sessionStorage; null jika belum ada */
   getProfile() {
     try {
-      const raw = localStorage.getItem(this.PROFILE_KEY);
+      const raw = sessionStorage.getItem(this.PROFILE_KEY);
       return raw ? JSON.parse(raw) : null;
     } catch (err) {
       console.error('[StorageService] Gagal membaca profil:', err);
@@ -82,11 +82,11 @@ const StorageService = {
   /** Hapus profil (logout) */
   clearProfile() {
     try {
-      localStorage.removeItem(this.PROFILE_KEY);
-      return true; // ✅ FIX #6: return boolean agar pemanggil bisa tahu apakah berhasil
+      sessionStorage.removeItem(this.PROFILE_KEY);
+      return true;
     } catch (err) {
       console.error('[StorageService] Gagal menghapus profil:', err);
-      return false; // ✅ FIX #6
+      return false;
     }
   },
 };
@@ -716,25 +716,23 @@ const App = {
 
       setButtonLoading(btn, true);
 
-      // Kosongkan database dulu sebelum masuk dashboard
+      // Simpan profil dulu ke sessionStorage
+      const saved = StorageService.saveProfile(result.data);
+      if (!saved) {
+        setButtonLoading(btn, false);
+        alert('Gagal menyimpan data. Periksa izin penyimpanan browser Anda.');
+        return;
+      }
+
+      // Kosongkan database setelah profil tersimpan
       await App._clearSupabaseData();
 
       setTimeout(() => {
-        const saved = StorageService.saveProfile(result.data);
-
-        if (!saved) {
-          setButtonLoading(btn, false);
-          alert('Gagal menyimpan data. Periksa izin penyimpanan browser Anda.');
-          return;
-        }
-
         FormController.hide();
-
         setTimeout(() => {
           loadDashboard(result.data);
           App._bindNavEvents();
         }, 300);
-
       }, 800);
     });
 
@@ -873,13 +871,13 @@ const ThemeController = {
 
   _save(theme) {
     try {
-      localStorage.setItem(this.STORAGE_KEY, theme);
+      sessionStorage.setItem(this.STORAGE_KEY, theme);
     } catch (_) {}
   },
 
   _load() {
     try {
-      const saved = localStorage.getItem(this.STORAGE_KEY);
+      const saved = sessionStorage.getItem(this.STORAGE_KEY);
       if (saved === 'dark' || saved === 'light') return saved;
     } catch (_) {}
     return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
