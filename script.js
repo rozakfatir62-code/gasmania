@@ -454,7 +454,7 @@ const DashboardController = {
         text: statusObj.text
       });
 
-      if (this._ppmData.length > 100) this._ppmData.shift();
+      if (this._ppmData.length > 50) this._ppmData.shift();
 
       const sum = this._ppmData.reduce((acc, cur) => acc + cur.bac, 0);
       const avg = sum / this._ppmData.length;
@@ -682,16 +682,27 @@ const App = {
 
   /** Hapus semua data di tabel alcohol_logs Supabase */
   async _clearSupabaseData() {
-    if (!supabaseClient) return;
+    if (!supabaseClient) {
+      console.warn('[ClearData] supabaseClient tidak tersedia, skip.');
+      return;
+    }
+    console.log('[ClearData] Mencoba menghapus semua data alcohol_logs...');
     try {
-      const { error } = await supabaseClient
+      const { data, error, status, statusText } = await supabaseClient
         .from('alcohol_logs')
         .delete()
-        .neq('id', 0); // neq('id', 0) = hapus semua baris karena id tidak ada yang 0
-      if (error) throw error;
-      console.log('[Supabase] Tabel alcohol_logs berhasil dikosongkan.');
+        .neq('id', 0);
+      
+      console.log('[ClearData] Response status:', status, statusText);
+      console.log('[ClearData] Data:', data);
+      
+      if (error) {
+        console.error('[ClearData] Error dari Supabase:', error.message, error.details, error.hint);
+        return;
+      }
+      console.log('[ClearData] ✅ Berhasil dikosongkan.');
     } catch (err) {
-      console.error('[Supabase] Gagal mengosongkan tabel:', err);
+      console.error('[ClearData] Exception:', err);
     }
   },
 
