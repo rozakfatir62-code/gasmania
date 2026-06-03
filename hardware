@@ -1,0 +1,368 @@
+/**
+ * ============================================================
+ * GASMANIA — ESP32 Firmware
+ * Sensor : MQ-3 (Alcohol / BAC)
+ * Display: OLED SSD1306 128x64 (I2C)
+ * Backend: Cloudflare Worker (HTTP POST)
+ * ============================================================
+ *
+ * Wiring:
+ *   MQ-3  AOUT  → GPIO 34 (ADC1_CH6)
+ *   MQ-3  VCC   → 5V
+ *   MQ-3  GND   → GND
+ *
+ *   SSD1306 SDA → GPIO 21
+ *   SSD1306 SCL → GPIO 22
+ *   SSD1306 VCC → 3.3V
+ *   SSD1306 GND → GND
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ============================================================
+// KONFIGURASI — Ganti sesuai milik Anda
+// ============================================================
+const char* WIFI_SSID     = "NAMA_WIFI_ANDA";
+const char* WIFI_PASSWORD = "PASSWORD_WIFI_ANDA";
+
+// URL endpoint Cloudflare Worker Anda
+const char* WORKER_URL    = "https://gasmania.NAMA_ANDA.workers.dev/api/sensor";
+
+// ============================================================
+// KONFIGURASI HARDWARE
+// ============================================================
+#define MQ3_PIN         34       // Pin ADC untuk sensor MQ-3
+#define OLED_WIDTH      128
+#define OLED_HEIGHT     64
+#define OLED_RESET      -1       // Reset pin (tidak dipakai, pakai -1)
+#define OLED_I2C_ADDR   0x3C    // Alamat I2C SSD1306 (biasanya 0x3C atau 0x3D)
+
+// ============================================================
+// KONFIGURASI SENSOR & PENGIRIMAN
+// ============================================================
+#define ADC_MAX         4095     // Resolusi ADC ESP32 (12-bit)
+#define VCC             3.3f     // Tegangan referensi ADC
+#define RL_VALUE        10.0f    // Nilai resistor Load (kΩ) pada modul MQ-3
+#define RO_CLEAN_AIR    60.0f    // Nilai R0 di udara bersih (perlu kalibrasi!)
+
+// Interval pengiriman data ke server (ms)
+#define SEND_INTERVAL_MS  5000  // Kirim setiap 5 detik
+
+// ============================================================
+// INISIALISASI OBJEK
+// ============================================================
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+
+// Variabel global
+float g_bacValue      = 0.0f;
+float g_rawAnalog     = 0;
+String g_statusText   = "Inisialisasi";
+String g_wifiStatus   = "Menghubungkan...";
+bool g_isConnected    = false;
+unsigned long g_lastSendTime = 0;
+int g_sendCount       = 0;
+bool g_lastSendOk     = false;
+
+
+// ============================================================
+// FUNGSI SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n==============================");
+  Serial.println("  GASMANIA ESP32 Firmware v1.0");
+  Serial.println("==============================");
+
+  // --- Inisialisasi OLED ---
+  initDisplay();
+
+  // --- Tampilkan splash screen ---
+  showSplash();
+
+  // --- Konfigurasi ADC ---
+  analogReadResolution(12);        // 12-bit: 0–4095
+  analogSetAttenuation(ADC_11db);  // Range: 0–3.3V
+
+  // --- Hubungkan ke WiFi ---
+  connectWiFi();
+
+  // --- Baca pertama kali ---
+  readAndUpdateSensor();
+
+  Serial.println("[Setup] Siap! Mulai monitoring...\n");
+}
+
+
+// ============================================================
+// LOOP UTAMA
+// ============================================================
+void loop() {
+  unsigned long now = millis();
+
+  // 1. Selalu baca sensor setiap loop
+  readAndUpdateSensor();
+
+  // 2. Update tampilan OLED
+  updateDisplay();
+
+  // 3. Kirim ke server setiap SEND_INTERVAL_MS
+  if (now - g_lastSendTime >= SEND_INTERVAL_MS) {
+    g_lastSendTime = now;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      g_isConnected = true;
+      sendToWorker(g_bacValue, (int)g_rawAnalog);
+    } else {
+      g_isConnected = false;
+      Serial.println("[WiFi] Koneksi terputus. Mencoba reconnect...");
+      WiFi.reconnect();
+    }
+  }
+
+  delay(500); // Baca sensor setiap 0.5 detik
+}
+
+
+// ============================================================
+// FUNGSI: Baca Sensor MQ-3 & Hitung BAC
+// ============================================================
+void readAndUpdateSensor() {
+  // Ambil rata-rata 10 sample untuk stabilitas
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(MQ3_PIN);
+    delay(5);
+  }
+  float rawAvg = sum / 10.0f;
+  g_rawAnalog = rawAvg;
+
+  // Konversi ADC ke tegangan
+  float voltage = (rawAvg / ADC_MAX) * VCC;
+
+  // Hitung Rs (sensor resistance)
+  // Rs = RL * (VCC - Vout) / Vout
+  float rs = 0.0f;
+  if (voltage > 0.01f) {
+    rs = RL_VALUE * (VCC - voltage) / voltage;
+  } else {
+    rs = RL_VALUE * 1000; // Hindari div by zero
+  }
+
+  // Rasio Rs/R0 — makin rendah = makin banyak alkohol
+  float ratio = rs / RO_CLEAN_AIR;
+
+  // Kurva karakteristik MQ-3 (pendekatan log-linear)
+  // BAC (%) ≈ a * ratio^b  →  log(BAC) = log(a) + b*log(ratio)
+  // Konstanta empiris untuk MQ-3 (dapat dikalibrasi ulang):
+  float a = 0.4f;
+  float b = -1.431f;
+  float bac = a * pow(ratio, b);
+
+  // Clamp nilai BAC ke range logis 0.00 – 0.40%
+  bac = constrain(bac, 0.0f, 0.40f);
+  g_bacValue = bac;
+
+  // Tentukan status
+  if (bac >= 0.08f) {
+    g_statusText = "BAHAYA";
+  } else if (bac >= 0.05f) {
+    g_statusText = "WASPADA";
+  } else {
+    g_statusText = "AMAN";
+  }
+
+  Serial.printf("[Sensor] Raw ADC: %.0f | Voltage: %.3fV | Rs: %.2fkΩ | Ratio: %.4f | BAC: %.3f%% | Status: %s\n",
+                rawAvg, voltage, rs, ratio, bac, g_statusText.c_str());
+}
+
+
+// ============================================================
+// FUNGSI: Kirim Data ke Cloudflare Worker
+// ============================================================
+void sendToWorker(float bacValue, int rawValue) {
+  Serial.printf("[HTTP] Mengirim data → BAC: %.3f%%\n", bacValue);
+
+  HTTPClient http;
+  http.begin(WORKER_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000); // Timeout 8 detik
+
+  // Buat payload JSON
+  // Format yang diterima Worker: { "bac": 0.05 }
+  StaticJsonDocument<128> doc;
+  doc["bac"]       = round(bacValue * 1000.0f) / 1000.0f; // 3 desimal
+  doc["raw"]       = rawValue;
+  doc["status"]    = g_statusText;
+
+  String payload;
+  serializeJson(doc, payload);
+  Serial.printf("[HTTP] Payload: %s\n", payload.c_str());
+
+  int httpCode = http.POST(payload);
+
+  if (httpCode == HTTP_CODE_OK || httpCode == 200) {
+    String response = http.getString();
+    Serial.printf("[HTTP] ✅ Berhasil! Code: %d | Response: %s\n", httpCode, response.c_str());
+    g_lastSendOk = true;
+    g_sendCount++;
+  } else if (httpCode > 0) {
+    Serial.printf("[HTTP] ⚠️ Server Error. Code: %d\n", httpCode);
+    g_lastSendOk = false;
+  } else {
+    Serial.printf("[HTTP] ❌ Gagal koneksi ke server. Error: %s\n", http.errorToString(httpCode).c_str());
+    g_lastSendOk = false;
+  }
+
+  http.end();
+}
+
+
+// ============================================================
+// FUNGSI: Inisialisasi Display OLED
+// ============================================================
+void initDisplay() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    Serial.println("[OLED] ❌ GAGAL! Periksa wiring I2C.");
+    // Lanjut meski OLED gagal, tetap kirim data ke server
+    return;
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  Serial.println("[OLED] ✅ SSD1306 berhasil diinisialisasi.");
+}
+
+
+// ============================================================
+// FUNGSI: Splash Screen
+// ============================================================
+void showSplash() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(15, 8);
+  display.println("GASMANIA");
+  display.setTextSize(1);
+  display.setCursor(20, 32);
+  display.println("IoT Gas Monitor");
+  display.setCursor(28, 46);
+  display.println("Initializing...");
+  display.display();
+  delay(2500);
+}
+
+
+// ============================================================
+// FUNGSI: Update Tampilan OLED
+// ============================================================
+void updateDisplay() {
+  display.clearDisplay();
+
+  // === BARIS 1: Judul ===
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("-- GASMANIA MONITOR --");
+
+  // === BARIS 2-3: Nilai BAC Besar ===
+  display.setTextSize(2);
+  display.setCursor(10, 14);
+  char bacStr[12];
+  sprintf(bacStr, "%.3f%%", g_bacValue);
+  display.print(bacStr);
+  display.setTextSize(1);
+  display.setCursor(95, 20);
+  display.print("BAC");
+
+  // === BARIS 4: Status ===
+  display.setTextSize(1);
+  display.setCursor(0, 34);
+  display.print("Status : ");
+
+  // Invert warna untuk status BAHAYA
+  if (g_statusText == "BAHAYA") {
+    display.fillRect(50, 32, 78, 10, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(52, 34);
+    display.print(g_statusText);
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.print(g_statusText);
+  }
+
+  // === BARIS 5: Raw ADC ===
+  display.setCursor(0, 46);
+  display.printf("Raw ADC: %.0f", g_rawAnalog);
+
+  // === BARIS 6: WiFi & Status Kirim ===
+  display.setCursor(0, 56);
+  if (g_isConnected) {
+    if (g_lastSendOk) {
+      display.printf("WiFi:OK  Sent:%d", g_sendCount);
+    } else {
+      display.print("WiFi:OK  Send:ERR");
+    }
+  } else {
+    display.print("WiFi: DISCONNECTED");
+  }
+
+  display.display();
+}
+
+
+// ============================================================
+// FUNGSI: Koneksi WiFi
+// ============================================================
+void connectWiFi() {
+  Serial.printf("[WiFi] Menghubungkan ke: %s\n", WIFI_SSID);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Connecting WiFi...");
+  display.setCursor(0, 16);
+  display.println(WIFI_SSID);
+  display.display();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(true);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+
+    // Animasi titik di OLED
+    display.setCursor(attempts * 4, 36);
+    display.print(".");
+    display.display();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    g_isConnected = true;
+    Serial.printf("\n[WiFi] ✅ Terhubung! IP: %s\n", WiFi.localIP().toString().c_str());
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi Connected!");
+    display.setCursor(0, 16);
+    display.print("IP: ");
+    display.println(WiFi.localIP().toString());
+    display.display();
+    delay(2000);
+  } else {
+    g_isConnected = false;
+    Serial.println("\n[WiFi] ❌ Gagal terhubung. Jalankan tanpa WiFi.");
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi FAILED!");
+    display.setCursor(0, 16);
+    display.println("Mode Offline");
+    display.display();
+    delay(2000);
+  }
+}
