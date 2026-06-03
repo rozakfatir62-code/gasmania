@@ -680,15 +680,33 @@ const App = {
     this._bindNavEvents();
   },
 
+  /** Hapus semua data di tabel alcohol_logs Supabase */
+  async _clearSupabaseData() {
+    if (!supabaseClient) return;
+    try {
+      const { error } = await supabaseClient
+        .from('alcohol_logs')
+        .delete()
+        .neq('id', 0); // neq('id', 0) = hapus semua baris karena id tidak ada yang 0
+      if (error) throw error;
+      console.log('[Supabase] Tabel alcohol_logs berhasil dikosongkan.');
+    } catch (err) {
+      console.error('[Supabase] Gagal mengosongkan tabel:', err);
+    }
+  },
+
   _bindFormEvents() {
     const btn = document.getElementById('btn-submit');
     if (!btn) return;
 
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const result = FormController.validate();
       if (!result.valid) return;
 
       setButtonLoading(btn, true);
+
+      // Kosongkan database dulu sebelum masuk dashboard
+      await App._clearSupabaseData();
 
       setTimeout(() => {
         const saved = StorageService.saveProfile(result.data);
